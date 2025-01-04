@@ -596,7 +596,10 @@ class Trainer:
         )
         self.data_collator = data_collator if data_collator is not None else default_collator
         self.train_dataset = train_dataset
+        self.train_dataloader = None
         self.eval_dataset = eval_dataset
+        self.eval_dataloader = None
+        self.test_dataloader = None
         self.processing_class = processing_class
 
         # Bnb Quantized models doesn't support `.to` operation.
@@ -972,8 +975,12 @@ class Trainer:
             model_input_name = (
                 self.processing_class.model_input_names[0] if self.processing_class is not None else None
             )
+            if self.is_megatron_enabled:
+                train_batch_size = self._train_batch_size
+            else:
+                train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
             return LengthGroupedSampler(
-                self.args.train_batch_size * self.args.gradient_accumulation_steps,
+                train_batch_size,
                 dataset=self.train_dataset,
                 lengths=lengths,
                 model_input_name=model_input_name,
@@ -991,6 +998,9 @@ class Trainer:
 
         Subclass and override this method if you want to inject some custom behavior.
         """
+        if self.is_megatron_enabled and self.train_dataloader is not None:
+            return self.train_dataloader
+
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
@@ -1015,12 +1025,23 @@ class Trainer:
             dataloader_params["worker_init_fn"] = seed_worker
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
-        return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
+        if self.is_megatron_enabled:
+            train_dataloader = DataLoader(train_dataset, **dataloader_params)
+            self.train_dataloader = train_dataloader
+        else:
+            train_dataloader = self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
+
+        return train_dataloader
 
     def _get_eval_sampler(self, eval_dataset: Dataset) -> Optional[torch.utils.data.Sampler]:
         if eval_dataset is None or not has_length(eval_dataset):
             return None
         # Build the sampler.
+
+        if self.is_megatron_enabled:
+            eval_batch_size = self._eval_batch_size
+        else:
+            eval_batch_size = self.args.eval_batch_size
 
         # Deprecated code
         if self.args.use_legacy_prediction_loop:
@@ -1033,7 +1054,7 @@ class Trainer:
                     eval_dataset,
                     num_replicas=smp.dp_size(),
                     rank=smp.dp_rank(),
-                    batch_size=self.args.per_device_eval_batch_size,
+                    batch_size=eval_batch_size,
                 )
             else:
                 return SequentialSampler(eval_dataset)
@@ -1049,7 +1070,7 @@ class Trainer:
                 lengths = None
             model_input_name = self.tokenizer.model_input_names[0] if self.tokenizer is not None else None
             return LengthGroupedSampler(
-                self.args.eval_batch_size,
+                eval_batch_size,
                 dataset=eval_dataset,
                 lengths=lengths,
                 model_input_name=model_input_name,
@@ -1070,6 +1091,10 @@ class Trainer:
             eval_dataset (`str` or `torch.utils.data.Dataset`, *optional*):
                 If a `str`, will use `self.eval_dataset[eval_dataset]` as the evaluation dataset. If a `Dataset`, will override `self.eval_dataset` and must implement `__len__`. If it is a [`~datasets.Dataset`], columns not accepted by the `model.forward()` method are automatically removed.
         """
+
+        if self.is_megatron_enabled and self.eval_dataloader is not None:
+            return self.eval_dataloader
+
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
 
@@ -1081,6 +1106,8 @@ class Trainer:
             and dataloader_key in self._eval_dataloaders
             and self.args.dataloader_persistent_workers
         ):
+            if self.is_megatron_enabled:
+                return self._eval_dataloaders[dataloader_key]
             return self.accelerator.prepare(self._eval_dataloaders[dataloader_key])
 
         eval_dataset = (
@@ -1097,8 +1124,13 @@ class Trainer:
         else:
             data_collator = self._get_collator_with_removed_columns(data_collator, description="evaluation")
 
+        if self.is_megatron_enabled:
+            eval_batch_size = self._eval_batch_size
+        else:
+            eval_batch_size = self.args.eval_batch_size
+
         dataloader_params = {
-            "batch_size": self.args.eval_batch_size,
+            "batch_size": eval_batch_size,
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
@@ -1119,7 +1151,12 @@ class Trainer:
             else:
                 self._eval_dataloaders = {dataloader_key: eval_dataloader}
 
-        return self.accelerator.prepare(eval_dataloader)
+        if not self.is_megatron_enabled:
+            eval_dataloader = self.accelerator.prepare(eval_dataloader)
+        else:
+            self.eval_dataloader = eval_dataloader
+
+        return eval_dataloader
 
     def get_test_dataloader(self, test_dataset: Dataset) -> DataLoader:
         """
@@ -1132,6 +1169,10 @@ class Trainer:
                 The test dataset to use. If it is a [`~datasets.Dataset`], columns not accepted by the
                 `model.forward()` method are automatically removed. It must implement `__len__`.
         """
+
+        if self.is_megatron_enabled and self.test_dataloader is not None:
+            return self.test_dataloader
+
         data_collator = self.data_collator
 
         if is_datasets_available() and isinstance(test_dataset, datasets.Dataset):
@@ -1139,8 +1180,13 @@ class Trainer:
         else:
             data_collator = self._get_collator_with_removed_columns(data_collator, description="test")
 
+        if self.is_megatron_enabled:
+            test_batch_size = self._eval_batch_size
+        else:
+            test_batch_size = self.args.eval_batch_size
+
         dataloader_params = {
-            "batch_size": self.args.eval_batch_size,
+            "batch_size": test_batch_size,
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
@@ -1153,7 +1199,12 @@ class Trainer:
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
         # We use the same batch_size as for eval.
-        return self.accelerator.prepare(DataLoader(test_dataset, **dataloader_params))
+        if self.is_megatron_enabled:
+            test_dataloader = DataLoader(test_dataset, **dataloader_params)
+            self.test_dataloader = test_dataloader
+        else:
+            test_dataloader = self.accelerator.prepare(DataLoader(test_dataset, **dataloader_params))
+        return test_dataloader
 
     def create_optimizer_and_scheduler(self, num_training_steps: int):
         """
@@ -2196,6 +2247,34 @@ class Trainer:
                     self.args.per_device_train_batch_size = original_bs
             self.state.train_batch_size = self._train_batch_size
         logger.debug(f"Currently training with a batch size of: {self._train_batch_size}")
+
+        if self.is_megatron_enabled:
+            self._eval_batch_size = self.args.per_device_eval_batch_size
+            train_dataloader = self.get_train_dataloader()
+            if self.args.max_steps == -1: # Default value
+                num_update_steps_per_epoch = math.ceil(len(train_dataloader) / self.args.gradient_accumulation_steps)
+                num_update_steps = num_update_steps_per_epoch * self.args.num_train_epochs
+            else:
+                num_update_steps = self.args.max_steps 
+
+            # Create optimizer and scheduler
+            self.create_optimizer()
+
+            # We are creating a dummy scheduler, Megatron will create its own scheduler
+            self.lr_scheduler = MegatronLMDummyScheduler(
+                    optimizer=self.optimizer,
+                    total_num_steps=num_update_steps,
+                    warmup_num_steps=self.args.warmup_steps,
+            )
+
+            self.model, self.train_dataloader, self.eval_dataloader, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
+                self.model, train_dataloader, self.get_eval_dataloader(), self.optimizer, self.lr_scheduler
+            )
+
+            if self.compute_metrics is not None:
+                logger.warning("compute_metrics is disabled for Megatron-LM. Only eval_loss will be calculated.")
+                self.compute_metrics = None
+
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
         if self.is_fsdp_xla_v2_enabled:
